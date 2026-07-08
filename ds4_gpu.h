@@ -129,6 +129,81 @@ int ds4_gpu_stream_expert_cache_seed_experts(
 void ds4_gpu_print_memory_report(const char *label);
 
 /* =========================================================================
+ * DS4_HYBRID_MOE spike: single-token routed MoE offload for the CPU decode
+ * path.
+ * =========================================================================
+ *
+ * Computes the routed-expert contribution for one decode token on the GPU,
+ * reusing the streaming expert cache (see ds4_gpu_stream_expert_cache_*
+ * above) so only the selected experts are copied into VRAM -- never the
+ * full model.  Router selection (top-k / hash) stays on the CPU; only the
+ * gate/up/SwiGLU/down matmuls for the already-selected experts run on GPU.
+ *
+ * `x` is the normed FFN input (expert_in_dim floats, host memory) and `out`
+ * receives the summed, weighted routed-expert output (out_dim floats, host
+ * memory), overwriting any previous contents.  Returns 1 on success, 0 if
+ * the GPU path could not be used (caller should fall back to the CPU
+ * implementation).
+ */
+int ds4_gpu_hybrid_moe_forward_one(
+        float               *out,
+        const void          *model_map,
+        uint64_t             model_size,
+        uint64_t             gate_offset,
+        uint64_t             up_offset,
+        uint64_t             down_offset,
+        uint32_t             gate_type,
+        uint32_t             down_type,
+        uint64_t             gate_expert_bytes,
+        uint64_t             gate_row_bytes,
+        uint64_t             down_expert_bytes,
+        uint64_t             down_row_bytes,
+        uint32_t             expert_in_dim,
+        uint32_t             expert_mid_dim,
+        uint32_t             out_dim,
+        uint32_t             n_total_expert,
+        const int32_t       *selected,
+        const float         *expert_weight,
+        uint32_t             n_expert_used,
+        float                clamp,
+        const float         *x,
+        uint32_t             layer_index);
+
+/* DS4_HYBRID_PREFILL: same contract as ds4_gpu_hybrid_moe_forward_one() above,
+ * but for a whole prefill token batch at once.  `x`, `selected` and
+ * `expert_weight` hold n_tok entries back to back (token-major, slot-minor:
+ * entry t*n_expert_used+slot), and `out` receives n_tok * out_dim floats.
+ * Every distinct expert the batch touches is loaded into the streaming cache
+ * once, then every (token, slot) pair is computed in a single kernel launch
+ * per stage -- see ds4_cuda.cu for the amortization and VRAM-budget details.
+ * Returns 1 on success, 0 if the GPU path could not be used (caller should
+ * fall back to the CPU implementation). */
+int ds4_gpu_hybrid_moe_forward_batch(
+        float               *out,
+        const void          *model_map,
+        uint64_t             model_size,
+        uint64_t             gate_offset,
+        uint64_t             up_offset,
+        uint64_t             down_offset,
+        uint32_t             gate_type,
+        uint32_t             down_type,
+        uint64_t             gate_expert_bytes,
+        uint64_t             gate_row_bytes,
+        uint64_t             down_expert_bytes,
+        uint64_t             down_row_bytes,
+        uint32_t             expert_in_dim,
+        uint32_t             expert_mid_dim,
+        uint32_t             out_dim,
+        uint32_t             n_total_expert,
+        const int32_t       *selected,
+        const float         *expert_weight,
+        uint32_t             n_expert_used,
+        float                clamp,
+        const float         *x,
+        uint32_t             layer_index,
+        uint32_t             n_tok);
+
+/* =========================================================================
  * Embeddings and Indexer Helpers.
  * =========================================================================
  *

@@ -15,6 +15,10 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -12938,6 +12942,1458 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              selected, weights, n_total_expert, n_expert, clamp, x,
                              layer_index, n_tokens);
 }
+/* =========================================================================
+ * DS4_HYBRID_MOE spike: single-token routed MoE offload for the CPU decode
+ * path (see ds4_gpu.h for the contract).  Only the already-selected experts
+ * are seeded into the existing streaming expert cache (g_stream_expert_cache)
+ * -- the full per-layer expert range and the non-routed weight cache
+ * (g_model_cache_full) are never touched, so this stays well within an 8GB
+ * budget.  All work runs on the default stream and is synchronized before
+ * returning: this is a correctness-first spike, not a fast path.
+ */
+#define DS4_HYBRID_MOE_MAX_EXPERT 16
+
+struct ds4_hybrid_moe_state {
+    int       allocated;
+    uint32_t  expert_in_dim;
+    uint32_t  expert_mid_dim;
+    uint32_t  out_dim;
+    uint32_t  n_expert_cap;
+    float               *d_x;
+    cuda_block_q8_K     *d_xq;
+    int32_t             *d_selected;
+    float               *d_weights;
+    float               *d_gate;
+    float               *d_up;
+    float               *d_mid;
+    cuda_block_q8_K     *d_midq;
+    float               *d_down;
+    float               *d_out;
+};
+static ds4_hybrid_moe_state g_hybrid_moe_state;
+
+static void ds4_hybrid_moe_state_release(void) {
+    ds4_hybrid_moe_state &s = g_hybrid_moe_state;
+    if (s.d_x) (void)cudaFree(s.d_x);
+    if (s.d_xq) (void)cudaFree(s.d_xq);
+    if (s.d_selected) (void)cudaFree(s.d_selected);
+    if (s.d_weights) (void)cudaFree(s.d_weights);
+    if (s.d_gate) (void)cudaFree(s.d_gate);
+    if (s.d_up) (void)cudaFree(s.d_up);
+    if (s.d_mid) (void)cudaFree(s.d_mid);
+    if (s.d_midq) (void)cudaFree(s.d_midq);
+    if (s.d_down) (void)cudaFree(s.d_down);
+    if (s.d_out) (void)cudaFree(s.d_out);
+    memset(&s, 0, sizeof(s));
+}
+
+/* (Re)allocates the small persistent device scratch buffers used by the
+ * hybrid MoE spike whenever the requested shape grows past what is already
+ * resident.  These buffers hold only activations for one token and the
+ * selected experts, never model weights. */
+static int ds4_hybrid_moe_state_ensure(
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t n_expert_used) {
+    ds4_hybrid_moe_state &s = g_hybrid_moe_state;
+    if (s.allocated &&
+        s.expert_in_dim == expert_in_dim &&
+        s.expert_mid_dim == expert_mid_dim &&
+        s.out_dim == out_dim &&
+        s.n_expert_cap >= n_expert_used) {
+        return 1;
+    }
+    ds4_hybrid_moe_state_release();
+
+    const uint32_t n_cap = n_expert_used;
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    int ok = 1;
+    ok = ok && cuda_ok(cudaMalloc(&s.d_x, (size_t)expert_in_dim * sizeof(float)), "hybrid moe d_x alloc");
+    ok = ok && cuda_ok(cudaMalloc(&s.d_xq, (size_t)xq_blocks * sizeof(cuda_block_q8_K)), "hybrid moe d_xq alloc");
+    ok = ok && cuda_ok(cudaMalloc(&s.d_selected, (size_t)n_cap * sizeof(int32_t)), "hybrid moe d_selected alloc");
+    ok = ok && cuda_ok(cudaMalloc(&s.d_weights, (size_t)n_cap * sizeof(float)), "hybrid moe d_weights alloc");
+    ok = ok && cuda_ok(cudaMalloc(&s.d_gate, (size_t)n_cap * expert_mid_dim * sizeof(float)), "hybrid moe d_gate alloc");
+    ok = ok && cuda_ok(cudaMalloc(&s.d_up, (size_t)n_cap * expert_mid_dim * sizeof(float)), "hybrid moe d_up alloc");
+    ok = ok && cuda_ok(cudaMalloc(&s.d_mid, (size_t)n_cap * expert_mid_dim * sizeof(float)), "hybrid moe d_mid alloc");
+    ok = ok && cuda_ok(cudaMalloc(&s.d_midq, (size_t)n_cap * midq_blocks * sizeof(cuda_block_q8_K)), "hybrid moe d_midq alloc");
+    ok = ok && cuda_ok(cudaMalloc(&s.d_down, (size_t)n_cap * out_dim * sizeof(float)), "hybrid moe d_down alloc");
+    ok = ok && cuda_ok(cudaMalloc(&s.d_out, (size_t)out_dim * sizeof(float)), "hybrid moe d_out alloc");
+    if (!ok) {
+        ds4_hybrid_moe_state_release();
+        return 0;
+    }
+    s.allocated = 1;
+    s.expert_in_dim = expert_in_dim;
+    s.expert_mid_dim = expert_mid_dim;
+    s.out_dim = out_dim;
+    s.n_expert_cap = n_cap;
+    return 1;
+}
+
+/* Profiling counters for the DS4_HYBRID_MOE spike (DS4_HYBRID_MOE_PROFILE=1).
+ * Global, per-process, not thread-safe -- this is a diagnostic spike, not a
+ * production feature. */
+static double ds4_hybrid_moe_now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+}
+
+struct ds4_hybrid_moe_profile_state {
+    int      enabled;
+    uint64_t calls;
+    uint64_t hits;
+    uint64_t misses;
+    double   load_sec;
+    double   upload_sec;
+    double   kernel_sec;
+    double   download_sec;
+    uint64_t t2_hits;
+    uint64_t t2_misses;
+    double   t2_hit_sec;
+    double   t2_miss_sec;
+    uint64_t parallel_batches;
+    double   parallel_wait_sec;
+    /* DS4_HYBRID_PREFILL batch counters (ds4_gpu_hybrid_moe_forward_batch). */
+    uint64_t batch_calls;
+    uint64_t batch_tokens;
+    uint64_t batch_unique_experts;
+};
+static ds4_hybrid_moe_profile_state g_hybrid_moe_profile;
+#define DS4_HYBRID_MOE_PROFILE_REPORT_EVERY 200
+
+static int ds4_hybrid_moe_profile_enabled(void) {
+    ds4_hybrid_moe_profile_state &p = g_hybrid_moe_profile;
+    if (p.enabled < 0) return 0;
+    if (p.enabled == 0) {
+        const char *env = getenv("DS4_HYBRID_MOE_PROFILE");
+        p.enabled = (env && *env && strcmp(env, "0") != 0) ? 1 : -1;
+    }
+    return p.enabled > 0;
+}
+
+static void ds4_hybrid_moe_profile_report(void) {
+    ds4_hybrid_moe_profile_state &p = g_hybrid_moe_profile;
+    fprintf(stderr,
+            "ds4: hybrid profile calls=%llu hits=%llu misses=%llu "
+            "load=%.1fms upload=%.1fms kernels=%.1fms download=%.1fms "
+            "t2_hits=%llu t2_misses=%llu t2_hit=%.1fms t2_miss=%.1fms "
+            "parallel_batches=%llu parallel_wait=%.1fms\n",
+            (unsigned long long)p.calls,
+            (unsigned long long)p.hits,
+            (unsigned long long)p.misses,
+            p.load_sec * 1e3,
+            p.upload_sec * 1e3,
+            p.kernel_sec * 1e3,
+            p.download_sec * 1e3,
+            (unsigned long long)p.t2_hits,
+            (unsigned long long)p.t2_misses,
+            p.t2_hit_sec * 1e3,
+            p.t2_miss_sec * 1e3,
+            (unsigned long long)p.parallel_batches,
+            p.parallel_wait_sec * 1e3);
+    if (p.batch_calls != 0) {
+        fprintf(stderr,
+                "ds4: hybrid prefill batch calls=%llu avg_tokens=%.1f "
+                "avg_unique_experts=%.1f\n",
+                (unsigned long long)p.batch_calls,
+                (double)p.batch_tokens / (double)p.batch_calls,
+                (double)p.batch_unique_experts / (double)p.batch_calls);
+    }
+}
+
+/* =========================================================================
+ * T2: host-pinned second-tier expert cache for the hybrid MoE spike.
+ * =========================================================================
+ *
+ * Sits between the VRAM streaming expert cache (g_stream_expert_cache) and
+ * the GGUF file.  On a VRAM miss the hybrid spike looks here first: a T2
+ * hit is a pinned-host-to-device memcpy (no pread at all), while a T2 miss
+ * reads the expert from the GGUF straight into the T2 pinned slot
+ * (write-through), so later evictions from VRAM only cost a memcpy.
+ *
+ * Budget: DS4_HYBRID_T2_GB (GiB, float, default 8; 0 disables T2 and
+ * restores the pre-T2 behavior).  Capped to MemAvailable - 4 GiB so the
+ * spike never starves the rest of the process.  Single-threaded, same as
+ * the rest of the hybrid MoE spike -- no locking.
+ */
+struct ds4_hybrid_t2_slot {
+    int         valid;
+    uint32_t    layer;
+    uint32_t    expert;
+    const void *model_map;
+    uint64_t    model_size;
+    uint64_t    gate_offset;
+    uint64_t    up_offset;
+    uint64_t    down_offset;
+    uint64_t    gate_expert_bytes;
+    uint64_t    down_expert_bytes;
+    uint64_t    age;
+};
+
+struct ds4_hybrid_t2_cache {
+    int        configured;
+    uint32_t   capacity;
+    uint32_t   count;
+    uint64_t   tick;
+    uint64_t   gate_expert_bytes;
+    uint64_t   down_expert_bytes;
+    char      *gate_ptr;
+    char      *up_ptr;
+    char      *down_ptr;
+    std::vector<ds4_hybrid_t2_slot>        slots;
+    std::unordered_map<uint64_t, uint32_t> index;
+};
+static ds4_hybrid_t2_cache g_hybrid_t2_cache;
+
+static double ds4_hybrid_t2_budget_gb(void) {
+    const char *env = getenv("DS4_HYBRID_T2_GB");
+    if (!env || !env[0]) return 8.0;
+    char *end = NULL;
+    const double v = strtod(env, &end);
+    if (end == env || v < 0.0) return 8.0;
+    return v;
+}
+
+/* Returns MemAvailable from /proc/meminfo in bytes, or UINT64_MAX if it
+ * cannot be read (the caller then skips the safety cap rather than
+ * guessing at a value). */
+static uint64_t ds4_hybrid_t2_mem_available_bytes(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return UINT64_MAX;
+    char line[256];
+    uint64_t kib = 0;
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long v = 0;
+        if (sscanf(line, "MemAvailable: %llu kB", &v) == 1) {
+            kib = (uint64_t)v;
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found ? kib * 1024ull : UINT64_MAX;
+}
+
+static void ds4_hybrid_t2_cache_release(void) {
+    ds4_hybrid_t2_cache &c = g_hybrid_t2_cache;
+    if (c.gate_ptr) (void)cudaFreeHost(c.gate_ptr);
+    if (c.up_ptr) (void)cudaFreeHost(c.up_ptr);
+    if (c.down_ptr) (void)cudaFreeHost(c.down_ptr);
+    c.gate_ptr = c.up_ptr = c.down_ptr = NULL;
+    c.slots.clear();
+    c.index.clear();
+    c.capacity = 0;
+    c.count = 0;
+    c.tick = 0;
+}
+
+/* (Re)configures the T2 pool for the given expert shape.  Cheap to call on
+ * every ds4_gpu_hybrid_moe_forward_one -- it is a no-op once the pool
+ * already matches the requested expert size. */
+static int ds4_hybrid_t2_cache_ensure(uint64_t gate_expert_bytes,
+                                      uint64_t down_expert_bytes) {
+    ds4_hybrid_t2_cache &c = g_hybrid_t2_cache;
+    if (c.configured &&
+        c.gate_expert_bytes == gate_expert_bytes &&
+        c.down_expert_bytes == down_expert_bytes) {
+        return c.capacity > 0;
+    }
+    ds4_hybrid_t2_cache_release();
+    c.configured = 1;
+    c.gate_expert_bytes = gate_expert_bytes;
+    c.down_expert_bytes = down_expert_bytes;
+
+    const double budget_gb = ds4_hybrid_t2_budget_gb();
+    if (budget_gb <= 0.0) return 0;
+    uint64_t budget_bytes = (uint64_t)(budget_gb * 1073741824.0);
+
+    const uint64_t mem_avail = ds4_hybrid_t2_mem_available_bytes();
+    if (mem_avail != UINT64_MAX) {
+        const uint64_t reserve = 4ull * 1073741824ull;
+        const uint64_t safe_cap = mem_avail > reserve ? mem_avail - reserve : 0;
+        if (budget_bytes > safe_cap) {
+            fprintf(stderr,
+                    "ds4: hybrid T2 cache: DS4_HYBRID_T2_GB=%.2f GiB ridotto a "
+                    "%.2f GiB per rispettare MemAvailable-4GiB\n",
+                    (double)budget_bytes / 1073741824.0,
+                    (double)safe_cap / 1073741824.0);
+            budget_bytes = safe_cap;
+        }
+    }
+
+    const uint64_t per_expert = 2ull * gate_expert_bytes + down_expert_bytes;
+    if (per_expert == 0 || budget_bytes < per_expert) {
+        if (budget_bytes > 0) {
+            fprintf(stderr,
+                    "ds4: hybrid T2 cache disabilitata: budget insufficiente "
+                    "per un singolo esperto\n");
+        }
+        return 0;
+    }
+
+    uint32_t cap = (uint32_t)(budget_bytes / per_expert);
+    while (cap > 0) {
+        cudaError_t err = cudaHostAlloc((void **)&c.gate_ptr,
+                                        (size_t)cap * gate_expert_bytes,
+                                        cudaHostAllocPortable);
+        if (err == cudaSuccess) {
+            err = cudaHostAlloc((void **)&c.up_ptr,
+                                (size_t)cap * gate_expert_bytes,
+                                cudaHostAllocPortable);
+        }
+        if (err == cudaSuccess) {
+            err = cudaHostAlloc((void **)&c.down_ptr,
+                                (size_t)cap * down_expert_bytes,
+                                cudaHostAllocPortable);
+        }
+        if (err == cudaSuccess) break;
+        fprintf(stderr,
+                "ds4: hybrid T2 cache pinned alloc fallita a %u esperti: %s\n",
+                cap, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        if (c.gate_ptr) { (void)cudaFreeHost(c.gate_ptr); c.gate_ptr = NULL; }
+        if (c.up_ptr) { (void)cudaFreeHost(c.up_ptr); c.up_ptr = NULL; }
+        if (c.down_ptr) { (void)cudaFreeHost(c.down_ptr); c.down_ptr = NULL; }
+        cap /= 2u;
+    }
+    if (cap == 0) return 0;
+
+    try {
+        c.slots.resize(cap);
+    } catch (...) {
+        fprintf(stderr, "ds4: hybrid T2 cache metadata allocation failed\n");
+        ds4_hybrid_t2_cache_release();
+        return 0;
+    }
+    c.capacity = cap;
+    c.count = 0;
+    fprintf(stderr,
+            "ds4: hybrid T2 host cache pronta: %u esperti pinned (%.2f GiB)\n",
+            cap, (double)cap * per_expert / 1073741824.0);
+    return 1;
+}
+
+static int ds4_hybrid_t2_find(uint32_t layer, uint32_t expert,
+                              const void *model_map, uint64_t model_size,
+                              uint64_t gate_offset, uint64_t up_offset,
+                              uint64_t down_offset, uint64_t gate_expert_bytes,
+                              uint64_t down_expert_bytes) {
+    ds4_hybrid_t2_cache &c = g_hybrid_t2_cache;
+    if (c.capacity == 0) return -1;
+    const uint64_t key = ((uint64_t)layer << 32) | expert;
+    const auto it = c.index.find(key);
+    if (it == c.index.end()) return -1;
+    const ds4_hybrid_t2_slot &s = c.slots[it->second];
+    if (!s.valid || s.model_map != model_map || s.model_size != model_size ||
+        s.gate_offset != gate_offset || s.up_offset != up_offset ||
+        s.down_offset != down_offset ||
+        s.gate_expert_bytes != gate_expert_bytes ||
+        s.down_expert_bytes != down_expert_bytes) {
+        return -1;
+    }
+    return (int)it->second;
+}
+
+static uint32_t ds4_hybrid_t2_lru_slot(void) {
+    ds4_hybrid_t2_cache &c = g_hybrid_t2_cache;
+    for (uint32_t i = 0; i < c.capacity; i++) {
+        if (!c.slots[i].valid) return i;
+    }
+    uint32_t slot = 0;
+    uint64_t best_age = c.slots[0].age;
+    for (uint32_t i = 1; i < c.capacity; i++) {
+        if (c.slots[i].age < best_age) {
+            best_age = c.slots[i].age;
+            slot = i;
+        }
+    }
+    return slot;
+}
+
+/* Records `expert` as valid in T2 slot `slot`, evicting whatever key used
+ * to live there from the index.  Pure bookkeeping, no I/O -- callers do
+ * the actual data copy themselves. */
+static void ds4_hybrid_t2_slot_mark_valid(uint32_t slot, uint32_t layer,
+                                          uint32_t expert,
+                                          const void *model_map,
+                                          uint64_t model_size,
+                                          uint64_t gate_offset,
+                                          uint64_t up_offset,
+                                          uint64_t down_offset,
+                                          uint64_t gate_expert_bytes,
+                                          uint64_t down_expert_bytes) {
+    ds4_hybrid_t2_cache &c = g_hybrid_t2_cache;
+    ds4_hybrid_t2_slot &s = c.slots[slot];
+    if (s.valid) c.index.erase(((uint64_t)s.layer << 32) | s.expert);
+    s.valid = 1;
+    s.layer = layer;
+    s.expert = expert;
+    s.model_map = model_map;
+    s.model_size = model_size;
+    s.gate_offset = gate_offset;
+    s.up_offset = up_offset;
+    s.down_offset = down_offset;
+    s.gate_expert_bytes = gate_expert_bytes;
+    s.down_expert_bytes = down_expert_bytes;
+    s.age = ++c.tick;
+    c.index[((uint64_t)layer << 32) | expert] = slot;
+    if (c.count < c.capacity) c.count++;
+}
+
+/* Write-behind population of a T2 slot from an expert that already sits in
+ * a VRAM cache slot: a small device-to-host memcpy of bytes already known
+ * to be correct, instead of a second, slower read from the GGUF.  Best
+ * effort -- if the copy fails the expert simply stays VRAM-only, which is
+ * not a fatal condition for the spike. */
+static void ds4_hybrid_t2_writeback_from_vram(
+        const cuda_stream_expert_cache *cache, uint32_t vram_slot,
+        uint32_t layer, uint32_t expert, const void *model_map,
+        uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t down_offset, uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    ds4_hybrid_t2_cache &t2 = g_hybrid_t2_cache;
+    if (t2.capacity == 0) return;
+
+    const uint32_t t2_slot = ds4_hybrid_t2_lru_slot();
+    const uint64_t vram_gate_src = (uint64_t)vram_slot * gate_expert_bytes;
+    const uint64_t vram_down_src = (uint64_t)vram_slot * down_expert_bytes;
+    const uint64_t t2_gate_dst = (uint64_t)t2_slot * t2.gate_expert_bytes;
+    const uint64_t t2_down_dst = (uint64_t)t2_slot * t2.down_expert_bytes;
+
+    const int ok =
+        cuda_ok(cudaMemcpy(t2.gate_ptr + t2_gate_dst,
+                          cache->gate_ptr + vram_gate_src,
+                          (size_t)gate_expert_bytes,
+                          cudaMemcpyDeviceToHost),
+               "hybrid moe VRAM->T2 gate writeback") &&
+        cuda_ok(cudaMemcpy(t2.up_ptr + t2_gate_dst,
+                          cache->up_ptr + vram_gate_src,
+                          (size_t)gate_expert_bytes,
+                          cudaMemcpyDeviceToHost),
+               "hybrid moe VRAM->T2 up writeback") &&
+        cuda_ok(cudaMemcpy(t2.down_ptr + t2_down_dst,
+                          cache->down_ptr + vram_down_src,
+                          (size_t)down_expert_bytes,
+                          cudaMemcpyDeviceToHost),
+               "hybrid moe VRAM->T2 down writeback");
+    if (!ok) return;
+
+    ds4_hybrid_t2_slot_mark_valid(t2_slot, layer, expert, model_map,
+                                 model_size, gate_offset, up_offset,
+                                 down_offset, gate_expert_bytes,
+                                 down_expert_bytes);
+}
+
+/* VRAM-cache seeding for the hybrid MoE spike, with the T2 host-pinned tier
+ * in front of the GGUF.  A VRAM hit is unchanged (LRU age bump, no I/O).
+ * On a VRAM miss:
+ *   - a T2 hit is a pinned-to-device memcpy (as before, no I/O either);
+ *   - a T2 miss loads the expert straight into VRAM via the same fast
+ *     streamed path used when T2 is disabled (O_DIRECT + pipelined pinned
+ *     staging), then writes the expert back into T2 with a cheap
+ *     device-to-host memcpy.  T2 is never populated with a pread anymore --
+ *     the old write-through miss path was slower than just not having T2 at
+ *     all, since it duplicated the GGUF read on top of the T2->VRAM copy.
+ * If T2 is disabled, `ds4_hybrid_t2_writeback_from_vram` is a no-op and
+ * this degrades to the pre-T2 pread-into-VRAM path exactly. */
+static int ds4_hybrid_moe_seed_one_with_t2(
+        cuda_stream_expert_cache *cache,
+        const void *model_map, uint64_t model_size,
+        uint32_t layer, uint32_t n_total_expert, uint32_t expert,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        int *vram_hit, int *t2_hit, double *t2_extra_sec) {
+    *vram_hit = 0;
+    *t2_hit = -1; /* -1 = T2 not consulted (VRAM already had it) */
+    if (t2_extra_sec) *t2_extra_sec = 0.0;
+
+    const int found = cuda_stream_expert_cache_find(
+            cache, model_map, model_size, layer, n_total_expert, expert,
+            gate_offset, up_offset, down_offset, gate_expert_bytes,
+            down_expert_bytes);
+    if (found >= 0) {
+        cache->slots[(uint32_t)found].age = ++cache->tick;
+        *vram_hit = 1;
+        return found;
+    }
+
+    (void)ds4_hybrid_t2_cache_ensure(gate_expert_bytes, down_expert_bytes);
+    const int t2_slot = ds4_hybrid_t2_find(
+            layer, expert, model_map, model_size, gate_offset, up_offset,
+            down_offset, gate_expert_bytes, down_expert_bytes);
+
+    if (t2_slot < 0) {
+        /* T2 miss (or T2 disabled): load straight into VRAM via the fast
+         * streamed path, exactly the T2-off behavior -- no pread into T2. */
+        *t2_hit = 0;
+        if (!cuda_stream_expert_cache_seed_one(
+                    cache, model_map, model_size, layer, n_total_expert,
+                    expert, gate_offset, up_offset, down_offset,
+                    gate_expert_bytes, down_expert_bytes)) {
+            return -1;
+        }
+        const int vram_slot = cuda_stream_expert_cache_find(
+                cache, model_map, model_size, layer, n_total_expert, expert,
+                gate_offset, up_offset, down_offset, gate_expert_bytes,
+                down_expert_bytes);
+        if (vram_slot < 0) return -1;
+
+        const double t2_t0 = t2_extra_sec ? ds4_hybrid_moe_now_sec() : 0.0;
+        ds4_hybrid_t2_writeback_from_vram(
+                cache, (uint32_t)vram_slot, layer, expert, model_map,
+                model_size, gate_offset, up_offset, down_offset,
+                gate_expert_bytes, down_expert_bytes);
+        if (t2_extra_sec) *t2_extra_sec = ds4_hybrid_moe_now_sec() - t2_t0;
+        return vram_slot;
+    }
+
+    ds4_hybrid_t2_cache &t2 = g_hybrid_t2_cache;
+    t2.slots[(uint32_t)t2_slot].age = ++t2.tick;
+    *t2_hit = 1;
+
+    const uint32_t vram_slot = cuda_stream_expert_cache_lru_slot(cache);
+    const int append = !cache->slots[vram_slot].valid;
+    const uint64_t t2_gate_src = (uint64_t)t2_slot * t2.gate_expert_bytes;
+    const uint64_t t2_down_src = (uint64_t)t2_slot * t2.down_expert_bytes;
+    const uint64_t gate_dst = (uint64_t)vram_slot * gate_expert_bytes;
+    const uint64_t down_dst = (uint64_t)vram_slot * down_expert_bytes;
+    const int ok =
+        cuda_ok(cudaMemcpy(cache->gate_ptr + gate_dst,
+                           t2.gate_ptr + t2_gate_src, (size_t)gate_expert_bytes,
+                           cudaMemcpyHostToDevice),
+               "hybrid moe T2->VRAM gate copy") &&
+        cuda_ok(cudaMemcpy(cache->up_ptr + gate_dst, t2.up_ptr + t2_gate_src,
+                           (size_t)gate_expert_bytes, cudaMemcpyHostToDevice),
+               "hybrid moe T2->VRAM up copy") &&
+        cuda_ok(cudaMemcpy(cache->down_ptr + down_dst,
+                           t2.down_ptr + t2_down_src, (size_t)down_expert_bytes,
+                           cudaMemcpyHostToDevice),
+               "hybrid moe T2->VRAM down copy");
+    if (!ok) return -1;
+
+    cuda_stream_expert_cache_slot &entry = cache->slots[vram_slot];
+    entry.valid = 1;
+    entry.model_map = model_map;
+    entry.model_size = model_size;
+    entry.layer = layer;
+    entry.n_total_expert = n_total_expert;
+    entry.expert = expert;
+    entry.gate_offset = gate_offset;
+    entry.up_offset = up_offset;
+    entry.down_offset = down_offset;
+    entry.gate_expert_bytes = gate_expert_bytes;
+    entry.down_expert_bytes = down_expert_bytes;
+    entry.age = ++cache->tick;
+    if (append && cache->count < cache->capacity) cache->count++;
+    return (int)vram_slot;
+}
+
+/* =========================================================================
+ * DS4_HYBRID_PARALLEL_LOAD: parallel SSD reads for true T1/T2 misses within
+ * one MoE batch (DS4_HYBRID_PARALLEL_LOAD=N, N = worker threads, default 0
+ * keeps the sequential path above byte-for-byte unchanged).
+ * =========================================================================
+ *
+ * Only the "real" miss -- an expert absent from both the VRAM cache and T2
+ * -- is slow enough (SSD read) to be worth parallelizing; VRAM hits and T2
+ * hits are resolved inline on the main thread exactly as before, since a
+ * pinned-to-device memcpy is already fast (~1.2ms).
+ *
+ * Design: for each true miss the main thread reserves a destination VRAM
+ * slot up front (LRU, skipping slots already claimed earlier in this same
+ * batch) and hands off a job -- gate/up/down offsets into the mmap'd model
+ * plus a dedicated per-job pinned host buffer -- to a small persistent
+ * worker pool. Workers only memcpy() from the model's mmap into their
+ * job's pinned buffer (the same source `cuda_model_copy_to_device_streamed`
+ * falls back to whenever no model fd is registered, e.g. the `--cpu`
+ * backend used by this spike); no CUDA calls happen off the main thread.
+ * Once every worker has finished, the main thread issues the host->device
+ * copies on `g_model_upload_stream`, waits once, and only then updates the
+ * cache slot metadata (valid/age/LRU) -- the streaming expert cache and
+ * the T2 cache stay single-thread-owned. */
+#define DS4_HYBRID_PARALLEL_MAX_THREADS 16
+
+struct ds4_hybrid_parallel_job {
+    uint32_t expert;
+    uint32_t vram_slot;
+    const void *model_map;
+    uint64_t gate_src;
+    uint64_t up_src;
+    uint64_t down_src;
+    uint64_t gate_bytes;
+    uint64_t down_bytes;
+    void    *host_buf;
+    int      ok;
+};
+
+struct ds4_hybrid_parallel_pool {
+    int                     initialized;
+    int                     n_threads;
+    std::mutex              mtx;
+    std::condition_variable cv_start;
+    std::condition_variable cv_done;
+    uint64_t                generation;
+    ds4_hybrid_parallel_job *jobs;
+    int                     job_count;
+    std::atomic<int>        next_job;
+    std::atomic<int>        completed;
+    std::atomic<bool>       shutdown;
+    std::vector<std::thread> workers;
+};
+static ds4_hybrid_parallel_pool g_hybrid_parallel_pool;
+
+struct ds4_hybrid_parallel_bufs {
+    int      allocated;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    void    *buf[DS4_HYBRID_MOE_MAX_EXPERT];
+};
+static ds4_hybrid_parallel_bufs g_hybrid_parallel_bufs;
+
+/* Reads DS4_HYBRID_PARALLEL_LOAD once (0 = feature off, matching the
+ * pre-existing sequential behavior exactly). */
+static int ds4_hybrid_parallel_n_threads(void) {
+    static int cached = -2;
+    if (cached != -2) return cached;
+    int n = 0;
+    const char *env = getenv("DS4_HYBRID_PARALLEL_LOAD");
+    if (env && env[0]) {
+        char *end = NULL;
+        const long v = strtol(env, &end, 10);
+        if (end != env && v > 0) n = (int)v;
+    }
+    if (n > DS4_HYBRID_PARALLEL_MAX_THREADS) n = DS4_HYBRID_PARALLEL_MAX_THREADS;
+    cached = n;
+    return n;
+}
+
+/* Worker loop: waits for a new generation, then races the other workers to
+ * claim job indices via an atomic counter (plain load-balancing, no
+ * per-job locking). Every job is an independent memcpy() from the mmap'd
+ * model into its own pinned buffer, so workers never touch shared cache
+ * state. */
+static void ds4_hybrid_parallel_worker(void) {
+    ds4_hybrid_parallel_pool &p = g_hybrid_parallel_pool;
+    uint64_t seen_gen = 0;
+    for (;;) {
+        ds4_hybrid_parallel_job *jobs = NULL;
+        int job_count = 0;
+        {
+            std::unique_lock<std::mutex> lock(p.mtx);
+            p.cv_start.wait(lock, [&] {
+                return p.shutdown.load(std::memory_order_relaxed) ||
+                       p.generation != seen_gen;
+            });
+            if (p.shutdown.load(std::memory_order_relaxed)) return;
+            seen_gen = p.generation;
+            jobs = p.jobs;
+            job_count = p.job_count;
+        }
+        for (;;) {
+            const int idx = p.next_job.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= job_count) break;
+            ds4_hybrid_parallel_job &job = jobs[idx];
+            char *buf = (char *)job.host_buf;
+            const char *src = (const char *)job.model_map;
+            memcpy(buf, src + job.gate_src, (size_t)job.gate_bytes);
+            memcpy(buf + job.gate_bytes, src + job.up_src,
+                   (size_t)job.gate_bytes);
+            memcpy(buf + 2u * job.gate_bytes, src + job.down_src,
+                   (size_t)job.down_bytes);
+            job.ok = 1;
+            const int done =
+                p.completed.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (done == job_count) {
+                std::lock_guard<std::mutex> lock(p.mtx);
+                p.cv_done.notify_all();
+            }
+        }
+    }
+}
+
+/* Signals every worker to stop and joins them. Registered via atexit() the
+ * first time the pool starts, so it always runs before `g_hybrid_parallel_
+ * pool`'s mutex/condition_variables are destroyed by static teardown --
+ * destroying those while a thread is still parked in cv_start.wait() is
+ * undefined behavior and is what caused the process to hang on exit
+ * (glibc's pthread_cond_destroy blocks until all waiters have left). */
+static void ds4_hybrid_parallel_pool_shutdown(void) {
+    ds4_hybrid_parallel_pool &p = g_hybrid_parallel_pool;
+    if (!p.initialized) return;
+    {
+        std::lock_guard<std::mutex> lock(p.mtx);
+        p.shutdown.store(true, std::memory_order_relaxed);
+    }
+    p.cv_start.notify_all();
+    for (std::thread &t : p.workers) {
+        if (t.joinable()) t.join();
+    }
+}
+
+/* Lazily starts the worker pool the first time parallel load is used.
+ * Threads are kept joinable (not detached) so ds4_hybrid_parallel_pool_
+ * shutdown(), registered below via atexit(), can signal and join them
+ * before the pool's mutex/condition_variables are torn down. */
+static int ds4_hybrid_parallel_pool_ensure(int n_threads) {
+    ds4_hybrid_parallel_pool &p = g_hybrid_parallel_pool;
+    if (p.initialized) return p.n_threads == n_threads;
+    try {
+        for (int i = 0; i < n_threads; i++) {
+            p.workers.emplace_back(ds4_hybrid_parallel_worker);
+        }
+    } catch (...) {
+        fprintf(stderr, "ds4: hybrid parallel load: thread pool start failed\n");
+        return 0;
+    }
+    p.n_threads = n_threads;
+    p.initialized = 1;
+    static int atexit_registered = 0;
+    if (!atexit_registered) {
+        atexit(ds4_hybrid_parallel_pool_shutdown);
+        atexit_registered = 1;
+    }
+    return 1;
+}
+
+/* (Re)allocates the per-job pinned host buffers (gate|up|down laid out back
+ * to back) used to stage parallel SSD reads.  One buffer per possible batch
+ * slot (DS4_HYBRID_MOE_MAX_EXPERT), so jobs within a batch never share a
+ * buffer and there is no reuse race to guard against. */
+static int ds4_hybrid_parallel_bufs_ensure(uint64_t gate_expert_bytes,
+                                           uint64_t down_expert_bytes) {
+    ds4_hybrid_parallel_bufs &b = g_hybrid_parallel_bufs;
+    if (b.allocated && b.gate_expert_bytes == gate_expert_bytes &&
+        b.down_expert_bytes == down_expert_bytes) {
+        return 1;
+    }
+    for (int i = 0; i < DS4_HYBRID_MOE_MAX_EXPERT; i++) {
+        if (b.buf[i]) { (void)cudaFreeHost(b.buf[i]); b.buf[i] = NULL; }
+    }
+    b.allocated = 0;
+    const uint64_t bytes = 2ull * gate_expert_bytes + down_expert_bytes;
+    for (int i = 0; i < DS4_HYBRID_MOE_MAX_EXPERT; i++) {
+        if (!cuda_ok(cudaHostAlloc(&b.buf[i], (size_t)bytes,
+                                  cudaHostAllocPortable),
+                    "hybrid parallel load pinned buffer alloc")) {
+            for (int j = 0; j <= i; j++) {
+                if (b.buf[j]) { (void)cudaFreeHost(b.buf[j]); b.buf[j] = NULL; }
+            }
+            return 0;
+        }
+    }
+    b.allocated = 1;
+    b.gate_expert_bytes = gate_expert_bytes;
+    b.down_expert_bytes = down_expert_bytes;
+    return 1;
+}
+
+/* Picks an LRU victim slot like cuda_stream_expert_cache_lru_slot, but
+ * skips slots already claimed earlier in the same batch (`reserved`) --
+ * those are either genuine hits or misses already queued for loading, and
+ * must not be double-assigned before their data has actually landed. */
+static uint32_t ds4_hybrid_parallel_reserve_slot(
+        const cuda_stream_expert_cache *cache,
+        const uint32_t *reserved, uint32_t n_reserved) {
+    for (uint32_t i = 0; i < cache->capacity; i++) {
+        int is_reserved = 0;
+        for (uint32_t r = 0; r < n_reserved; r++) {
+            if (reserved[r] == i) { is_reserved = 1; break; }
+        }
+        if (is_reserved) continue;
+        if (!cache->slots[i].valid) return i;
+    }
+    uint32_t slot = cache->capacity;
+    uint64_t best_age = UINT64_MAX;
+    for (uint32_t i = 0; i < cache->capacity; i++) {
+        int is_reserved = 0;
+        for (uint32_t r = 0; r < n_reserved; r++) {
+            if (reserved[r] == i) { is_reserved = 1; break; }
+        }
+        if (is_reserved) continue;
+        if (cache->slots[i].age < best_age) {
+            best_age = cache->slots[i].age;
+            slot = i;
+        }
+    }
+    return slot;
+}
+
+/* Blocks until every job in `jobs[0..n)` has been picked up and completed
+ * by the worker pool. */
+static void ds4_hybrid_parallel_run_batch(ds4_hybrid_parallel_job *jobs, int n) {
+    ds4_hybrid_parallel_pool &p = g_hybrid_parallel_pool;
+    {
+        std::lock_guard<std::mutex> lock(p.mtx);
+        p.jobs = jobs;
+        p.job_count = n;
+        p.next_job.store(0, std::memory_order_relaxed);
+        p.completed.store(0, std::memory_order_relaxed);
+        p.generation++;
+    }
+    p.cv_start.notify_all();
+    std::unique_lock<std::mutex> lock(p.mtx);
+    p.cv_done.wait(lock, [&] {
+        return p.completed.load(std::memory_order_acquire) >= n;
+    });
+}
+
+/* Parallel-load counterpart of the sequential per-expert loop in
+ * ds4_gpu_hybrid_moe_forward_one: same VRAM/T2/GGUF lookup order and the
+ * same end state (every selected expert resident in `cache` with coherent
+ * metadata), but true misses are read from the GGUF concurrently instead
+ * of one at a time. */
+static int ds4_hybrid_moe_seed_batch_parallel(
+        cuda_stream_expert_cache *cache,
+        const void *model_map, uint64_t model_size,
+        uint32_t layer, uint32_t n_total_expert,
+        const int32_t *selected, uint32_t n_expert_used,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        int n_threads, int32_t *slot_ids, int profile) {
+    if (!ds4_hybrid_parallel_pool_ensure(n_threads)) return 0;
+    if (!ds4_hybrid_parallel_bufs_ensure(gate_expert_bytes, down_expert_bytes)) {
+        return 0;
+    }
+
+    uint32_t reserved[DS4_HYBRID_MOE_MAX_EXPERT];
+    uint32_t n_reserved = 0;
+    ds4_hybrid_parallel_job jobs[DS4_HYBRID_MOE_MAX_EXPERT];
+    int n_jobs = 0;
+
+    const double phase1_t0 = profile ? ds4_hybrid_moe_now_sec() : 0.0;
+    for (uint32_t i = 0; i < n_expert_used; i++) {
+        const uint32_t expert = (uint32_t)selected[i];
+        if (expert >= n_total_expert) return 0;
+
+        const int found = cuda_stream_expert_cache_find(
+                cache, model_map, model_size, layer, n_total_expert, expert,
+                gate_offset, up_offset, down_offset, gate_expert_bytes,
+                down_expert_bytes);
+        if (found >= 0) {
+            cache->slots[(uint32_t)found].age = ++cache->tick;
+            slot_ids[i] = found;
+            reserved[n_reserved++] = (uint32_t)found;
+            if (profile) g_hybrid_moe_profile.hits++;
+            continue;
+        }
+        if (profile) g_hybrid_moe_profile.misses++;
+
+        (void)ds4_hybrid_t2_cache_ensure(gate_expert_bytes, down_expert_bytes);
+        const int t2_slot = ds4_hybrid_t2_find(
+                layer, expert, model_map, model_size, gate_offset, up_offset,
+                down_offset, gate_expert_bytes, down_expert_bytes);
+
+        const uint32_t vram_slot =
+            ds4_hybrid_parallel_reserve_slot(cache, reserved, n_reserved);
+        if (vram_slot >= cache->capacity) return 0;
+        reserved[n_reserved++] = vram_slot;
+        const int append = !cache->slots[vram_slot].valid;
+
+        if (t2_slot >= 0) {
+            /* T2 hit: cheap pinned->device copy, resolved inline just like
+             * the sequential path -- not worth a worker round-trip. */
+            ds4_hybrid_t2_cache &t2 = g_hybrid_t2_cache;
+            t2.slots[(uint32_t)t2_slot].age = ++t2.tick;
+            const uint64_t t2_gate_src = (uint64_t)t2_slot * t2.gate_expert_bytes;
+            const uint64_t t2_down_src = (uint64_t)t2_slot * t2.down_expert_bytes;
+            const uint64_t gate_dst = (uint64_t)vram_slot * gate_expert_bytes;
+            const uint64_t down_dst = (uint64_t)vram_slot * down_expert_bytes;
+            const int ok =
+                cuda_ok(cudaMemcpy(cache->gate_ptr + gate_dst,
+                                   t2.gate_ptr + t2_gate_src,
+                                   (size_t)gate_expert_bytes,
+                                   cudaMemcpyHostToDevice),
+                       "hybrid moe T2->VRAM gate copy (parallel)") &&
+                cuda_ok(cudaMemcpy(cache->up_ptr + gate_dst,
+                                   t2.up_ptr + t2_gate_src,
+                                   (size_t)gate_expert_bytes,
+                                   cudaMemcpyHostToDevice),
+                       "hybrid moe T2->VRAM up copy (parallel)") &&
+                cuda_ok(cudaMemcpy(cache->down_ptr + down_dst,
+                                   t2.down_ptr + t2_down_src,
+                                   (size_t)down_expert_bytes,
+                                   cudaMemcpyHostToDevice),
+                       "hybrid moe T2->VRAM down copy (parallel)");
+            if (!ok) return 0;
+
+            cuda_stream_expert_cache_slot &entry = cache->slots[vram_slot];
+            entry.valid = 1;
+            entry.model_map = model_map;
+            entry.model_size = model_size;
+            entry.layer = layer;
+            entry.n_total_expert = n_total_expert;
+            entry.expert = expert;
+            entry.gate_offset = gate_offset;
+            entry.up_offset = up_offset;
+            entry.down_offset = down_offset;
+            entry.gate_expert_bytes = gate_expert_bytes;
+            entry.down_expert_bytes = down_expert_bytes;
+            entry.age = ++cache->tick;
+            if (append && cache->count < cache->capacity) cache->count++;
+
+            slot_ids[i] = (int32_t)vram_slot;
+            if (profile) g_hybrid_moe_profile.t2_hits++;
+            continue;
+        }
+
+        /* True miss: queue for the worker pool.  The slot is reserved (see
+         * above) but left exactly as it was until phase 3 confirms the
+         * memcpy actually landed. */
+        ds4_hybrid_parallel_job &job = jobs[n_jobs];
+        job.expert = expert;
+        job.vram_slot = vram_slot;
+        job.model_map = model_map;
+        job.gate_src = gate_offset + (uint64_t)expert * gate_expert_bytes;
+        job.up_src = up_offset + (uint64_t)expert * gate_expert_bytes;
+        job.down_src = down_offset + (uint64_t)expert * down_expert_bytes;
+        job.gate_bytes = gate_expert_bytes;
+        job.down_bytes = down_expert_bytes;
+        job.host_buf = g_hybrid_parallel_bufs.buf[n_jobs];
+        job.ok = 0;
+        slot_ids[i] = (int32_t)vram_slot;
+        n_jobs++;
+    }
+    if (profile) {
+        g_hybrid_moe_profile.load_sec += ds4_hybrid_moe_now_sec() - phase1_t0;
+    }
+    if (n_jobs == 0) return 1;
+
+    /* Phase 2: N worker threads read the true misses from the GGUF fd
+     * concurrently, each into its own pinned buffer. */
+    const double wait_t0 = profile ? ds4_hybrid_moe_now_sec() : 0.0;
+    ds4_hybrid_parallel_run_batch(jobs, n_jobs);
+    if (profile) {
+        g_hybrid_moe_profile.parallel_wait_sec +=
+            ds4_hybrid_moe_now_sec() - wait_t0;
+        g_hybrid_moe_profile.parallel_batches++;
+    }
+
+    /* Phase 3: main thread uploads every finished job, then commits (or, on
+     * failure, rolls back) the cache slot metadata -- single-thread owned,
+     * as with the rest of the streaming expert cache. */
+    const double upload_t0 = profile ? ds4_hybrid_moe_now_sec() : 0.0;
+    int all_ok = 1;
+    for (int j = 0; j < n_jobs; j++) {
+        ds4_hybrid_parallel_job &job = jobs[j];
+        if (!job.ok) { all_ok = 0; continue; }
+        const uint64_t gate_dst = (uint64_t)job.vram_slot * gate_expert_bytes;
+        const uint64_t down_dst = (uint64_t)job.vram_slot * down_expert_bytes;
+        const char *gate_host = (const char *)job.host_buf;
+        const char *up_host = gate_host + gate_expert_bytes;
+        const char *down_host = up_host + gate_expert_bytes;
+        const int ok =
+            cuda_ok(cudaMemcpyAsync(cache->gate_ptr + gate_dst, gate_host,
+                                    (size_t)gate_expert_bytes,
+                                    cudaMemcpyHostToDevice,
+                                    g_model_upload_stream),
+                   "hybrid moe parallel gate upload") &&
+            cuda_ok(cudaMemcpyAsync(cache->up_ptr + gate_dst, up_host,
+                                    (size_t)gate_expert_bytes,
+                                    cudaMemcpyHostToDevice,
+                                    g_model_upload_stream),
+                   "hybrid moe parallel up upload") &&
+            cuda_ok(cudaMemcpyAsync(cache->down_ptr + down_dst, down_host,
+                                    (size_t)down_expert_bytes,
+                                    cudaMemcpyHostToDevice,
+                                    g_model_upload_stream),
+                   "hybrid moe parallel down upload");
+        if (!ok) { job.ok = 0; all_ok = 0; }
+    }
+    if (!cuda_ok(cudaStreamSynchronize(g_model_upload_stream),
+                "hybrid moe parallel upload sync")) {
+        all_ok = 0;
+    }
+
+    for (int j = 0; j < n_jobs; j++) {
+        ds4_hybrid_parallel_job &job = jobs[j];
+        cuda_stream_expert_cache_slot &entry = cache->slots[job.vram_slot];
+        if (!job.ok) {
+            /* Load failed: leave the slot invalid rather than risk a false
+             * hit against a mapping whose data never actually landed. */
+            entry.valid = 0;
+            continue;
+        }
+        const int append = !entry.valid;
+        entry.valid = 1;
+        entry.model_map = model_map;
+        entry.model_size = model_size;
+        entry.layer = layer;
+        entry.n_total_expert = n_total_expert;
+        entry.expert = job.expert;
+        entry.gate_offset = gate_offset;
+        entry.up_offset = up_offset;
+        entry.down_offset = down_offset;
+        entry.gate_expert_bytes = gate_expert_bytes;
+        entry.down_expert_bytes = down_expert_bytes;
+        entry.age = ++cache->tick;
+        if (append && cache->count < cache->capacity) cache->count++;
+
+        const double t2_t0 = profile ? ds4_hybrid_moe_now_sec() : 0.0;
+        ds4_hybrid_t2_writeback_from_vram(
+                cache, job.vram_slot, layer, job.expert, model_map, model_size,
+                gate_offset, up_offset, down_offset, gate_expert_bytes,
+                down_expert_bytes);
+        if (profile) {
+            g_hybrid_moe_profile.t2_misses++;
+            g_hybrid_moe_profile.t2_miss_sec += ds4_hybrid_moe_now_sec() - t2_t0;
+        }
+    }
+    if (profile) {
+        g_hybrid_moe_profile.upload_sec += ds4_hybrid_moe_now_sec() - upload_t0;
+    }
+    return all_ok;
+}
+
+/* Shared lazy-init gate for the hybrid MoE spike: both forward_one (decode)
+ * and forward_batch (prefill) call this instead of keeping their own static
+ * `gpu_ready`, so ds4_gpu_init() -- and its "CUDA backend initialized" log
+ * line -- runs at most once per process regardless of which path fires
+ * first. */
+static int ds4_hybrid_gpu_ready(void) {
+    static int gpu_ready = -1;
+    if (gpu_ready < 0) gpu_ready = ds4_gpu_init() ? 1 : 0;
+    return gpu_ready;
+}
+
+extern "C" int ds4_gpu_hybrid_moe_forward_one(
+        float               *out,
+        const void          *model_map,
+        uint64_t             model_size,
+        uint64_t             gate_offset,
+        uint64_t             up_offset,
+        uint64_t             down_offset,
+        uint32_t             gate_type,
+        uint32_t             down_type,
+        uint64_t             gate_expert_bytes,
+        uint64_t             gate_row_bytes,
+        uint64_t             down_expert_bytes,
+        uint64_t             down_row_bytes,
+        uint32_t             expert_in_dim,
+        uint32_t             expert_mid_dim,
+        uint32_t             out_dim,
+        uint32_t             n_total_expert,
+        const int32_t       *selected,
+        const float         *expert_weight,
+        uint32_t             n_expert_used,
+        float                clamp,
+        const float         *x,
+        uint32_t             layer_index) {
+    const int profile = ds4_hybrid_moe_profile_enabled();
+    /* This spike only speaks the DeepSeek V4 Flash quant layout: IQ2_XXS
+     * gate/up, Q2_K down (ggml type ids 16 and 10). */
+    if (gate_type != 16u || down_type != 10u) return 0;
+    if (!out || !model_map || !selected || !expert_weight || !x ||
+        n_expert_used == 0 || n_expert_used > DS4_HYBRID_MOE_MAX_EXPERT ||
+        expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0) {
+        return 0;
+    }
+
+    if (!ds4_hybrid_gpu_ready()) return 0;
+
+    cuda_stream_expert_cache *cache =
+        cuda_stream_expert_cache_prepare(gate_expert_bytes, down_expert_bytes, n_expert_used);
+    if (!cache || cache->capacity < n_expert_used) return 0;
+
+    if (profile) {
+        static int atexit_registered = 0;
+        g_hybrid_moe_profile.calls++;
+        if (!atexit_registered) {
+            atexit(ds4_hybrid_moe_profile_report);
+            atexit_registered = 1;
+        }
+    }
+
+    int32_t slot_ids[DS4_HYBRID_MOE_MAX_EXPERT];
+    const int parallel_threads = ds4_hybrid_parallel_n_threads();
+    if (parallel_threads > 0) {
+        if (!ds4_hybrid_moe_seed_batch_parallel(
+                    cache, model_map, model_size, layer_index, n_total_expert,
+                    selected, n_expert_used, gate_offset, up_offset,
+                    down_offset, gate_expert_bytes, down_expert_bytes,
+                    parallel_threads, slot_ids, profile)) {
+            return 0;
+        }
+    } else {
+        for (uint32_t i = 0; i < n_expert_used; i++) {
+            const uint32_t expert = (uint32_t)selected[i];
+            if (expert >= n_total_expert) return 0;
+            const double load_t0 = profile ? ds4_hybrid_moe_now_sec() : 0.0;
+            int vram_hit = 0;
+            int t2_hit = -1;
+            double t2_extra_sec = 0.0;
+            const int slot = ds4_hybrid_moe_seed_one_with_t2(
+                    cache, model_map, model_size, layer_index, n_total_expert,
+                    expert, gate_offset, up_offset, down_offset,
+                    gate_expert_bytes, down_expert_bytes, &vram_hit, &t2_hit,
+                    &t2_extra_sec);
+            if (slot < 0) return 0;
+            if (profile) {
+                const double elapsed = ds4_hybrid_moe_now_sec() - load_t0;
+                g_hybrid_moe_profile.load_sec += elapsed;
+                if (vram_hit) {
+                    g_hybrid_moe_profile.hits++;
+                } else {
+                    g_hybrid_moe_profile.misses++;
+                    if (t2_hit == 1) {
+                        g_hybrid_moe_profile.t2_hits++;
+                        g_hybrid_moe_profile.t2_hit_sec += elapsed;
+                    } else if (t2_hit == 0) {
+                        /* T1 load time is already in load_sec above; here we
+                         * only track the extra VRAM->T2 writeback cost. */
+                        g_hybrid_moe_profile.t2_misses++;
+                        g_hybrid_moe_profile.t2_miss_sec += t2_extra_sec;
+                    }
+                }
+            }
+            slot_ids[i] = slot;
+        }
+    }
+
+    if (!ds4_hybrid_moe_state_ensure(expert_in_dim, expert_mid_dim, out_dim, n_expert_used)) {
+        return 0;
+    }
+    ds4_hybrid_moe_state &s = g_hybrid_moe_state;
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    int ok = 1;
+
+    const double upload_t0 = profile ? ds4_hybrid_moe_now_sec() : 0.0;
+    ok = ok && cuda_ok(cudaMemcpy(s.d_x, x, (size_t)expert_in_dim * sizeof(float), cudaMemcpyHostToDevice),
+                       "hybrid moe x upload");
+    ok = ok && cuda_ok(cudaMemcpy(s.d_selected, slot_ids, (size_t)n_expert_used * sizeof(int32_t), cudaMemcpyHostToDevice),
+                       "hybrid moe selected upload");
+    ok = ok && cuda_ok(cudaMemcpy(s.d_weights, expert_weight, (size_t)n_expert_used * sizeof(float), cudaMemcpyHostToDevice),
+                       "hybrid moe weights upload");
+    if (profile) g_hybrid_moe_profile.upload_sec += ds4_hybrid_moe_now_sec() - upload_t0;
+
+    const double kernel_t0 = profile ? ds4_hybrid_moe_now_sec() : 0.0;
+    if (ok) {
+        dim3 xq_grid(xq_blocks, 1, 1);
+        q8_K_quantize_kernel<<<xq_grid, 256>>>(s.d_xq, s.d_x, expert_in_dim, 1);
+        ok = cuda_ok(cudaGetLastError(), "hybrid moe x quantize launch");
+    }
+    if (ok) {
+        dim3 qgrid((expert_mid_dim + 127u) / 128u, n_expert_used, 1);
+        moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256>>>(
+                s.d_gate, s.d_up, s.d_mid,
+                cache->gate_ptr, cache->up_ptr,
+                s.d_xq, s.d_selected, s.d_weights,
+                gate_expert_bytes, gate_row_bytes,
+                xq_blocks, expert_mid_dim, n_expert_used, clamp);
+        ok = cuda_ok(cudaGetLastError(), "hybrid moe gate/up launch");
+    }
+    if (ok) {
+        dim3 midq_grid(midq_blocks, n_expert_used, 1);
+        q8_K_quantize_kernel<<<midq_grid, 256>>>(s.d_midq, s.d_mid, expert_mid_dim, n_expert_used);
+        ok = cuda_ok(cudaGetLastError(), "hybrid moe mid quantize launch");
+    }
+    if (ok) {
+        dim3 dgrid((out_dim + 31u) / 32u, n_expert_used, 1);
+        moe_down_qwarp32_kernel<<<dgrid, 256>>>(
+                s.d_down, cache->down_ptr, s.d_midq, s.d_selected,
+                down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert_used);
+        ok = cuda_ok(cudaGetLastError(), "hybrid moe down launch");
+    }
+    if (ok) {
+        moe_sum_kernel<<<(out_dim + 255u) / 256u, 256>>>(s.d_out, s.d_down, out_dim, n_expert_used, 1);
+        ok = cuda_ok(cudaGetLastError(), "hybrid moe sum launch");
+    }
+    if (profile) {
+        if (ok) cudaDeviceSynchronize();
+        g_hybrid_moe_profile.kernel_sec += ds4_hybrid_moe_now_sec() - kernel_t0;
+    }
+
+    const double download_t0 = profile ? ds4_hybrid_moe_now_sec() : 0.0;
+    if (ok) {
+        ok = cuda_ok(cudaMemcpy(out, s.d_out, (size_t)out_dim * sizeof(float), cudaMemcpyDeviceToHost),
+                     "hybrid moe out download");
+    }
+    if (profile) {
+        g_hybrid_moe_profile.download_sec += ds4_hybrid_moe_now_sec() - download_t0;
+        if (g_hybrid_moe_profile.calls % DS4_HYBRID_MOE_PROFILE_REPORT_EVERY == 0) {
+            ds4_hybrid_moe_profile_report();
+        }
+    }
+    return ok;
+}
+
+/* ============================================================================
+ * DS4_HYBRID_PREFILL: routed MoE offload for a whole prefill token batch.
+ * ============================================================================
+ *
+ * Same VRAM budget and streaming-cache reuse as ds4_gpu_hybrid_moe_forward_one
+ * above, but amortizes expert loads across every token in the batch: each
+ * distinct expert requested by any token in `x` is seeded into the streaming
+ * cache exactly once, then the gate/up/SwiGLU/down/sum kernels run in a
+ * single launch over every (token, slot) pair -- they are already written to
+ * take an `n_tokens`/pair-count dimension (see the full-GPU routed_moe path
+ * above), so no new kernels are needed for this MVP.
+ *
+ * `x` holds n_tok normed FFN inputs back to back (n_tok * expert_in_dim
+ * floats), `selected`/`expert_weight` hold n_tok * n_expert_used entries in
+ * the same (token-major, slot-minor) layout, and `out` receives n_tok *
+ * out_dim floats.  Returns 1 on success, 0 if the GPU path could not be used
+ * (caller should fall back to the CPU implementation) -- in particular, if
+ * the streaming cache's configured capacity is smaller than the number of
+ * distinct experts this batch needs, this declines up front rather than
+ * risking a slot being evicted (and silently reused for the wrong expert)
+ * between seeding and use. */
+struct ds4_hybrid_moe_batch_io_state {
+    int       allocated;
+    uint32_t  expert_in_dim;
+    uint32_t  out_dim;
+    uint32_t  n_tok_cap;
+    float               *d_x;
+    cuda_block_q8_K     *d_xq;
+    float               *d_out;
+};
+static ds4_hybrid_moe_batch_io_state g_hybrid_moe_batch_io_state;
+
+static void ds4_hybrid_moe_batch_io_state_release(void) {
+    ds4_hybrid_moe_batch_io_state &s = g_hybrid_moe_batch_io_state;
+    if (s.d_x) (void)cudaFree(s.d_x);
+    if (s.d_xq) (void)cudaFree(s.d_xq);
+    if (s.d_out) (void)cudaFree(s.d_out);
+    memset(&s, 0, sizeof(s));
+}
+
+static int ds4_hybrid_moe_batch_io_state_ensure(
+        uint32_t expert_in_dim, uint32_t out_dim, uint32_t n_tok) {
+    ds4_hybrid_moe_batch_io_state &s = g_hybrid_moe_batch_io_state;
+    if (s.allocated && s.expert_in_dim == expert_in_dim &&
+        s.out_dim == out_dim && s.n_tok_cap >= n_tok) {
+        return 1;
+    }
+    ds4_hybrid_moe_batch_io_state_release();
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    int ok = 1;
+    ok = ok && cuda_ok(cudaMalloc(&s.d_x, (size_t)n_tok * expert_in_dim * sizeof(float)),
+                       "hybrid moe batch d_x alloc");
+    ok = ok && cuda_ok(cudaMalloc(&s.d_xq, (size_t)n_tok * xq_blocks * sizeof(cuda_block_q8_K)),
+                       "hybrid moe batch d_xq alloc");
+    ok = ok && cuda_ok(cudaMalloc(&s.d_out, (size_t)n_tok * out_dim * sizeof(float)),
+                       "hybrid moe batch d_out alloc");
+    if (!ok) {
+        ds4_hybrid_moe_batch_io_state_release();
+        return 0;
+    }
+    s.allocated = 1;
+    s.expert_in_dim = expert_in_dim;
+    s.out_dim = out_dim;
+    s.n_tok_cap = n_tok;
+    return 1;
+}
+
+extern "C" int ds4_gpu_hybrid_moe_forward_batch(
+        float               *out,
+        const void          *model_map,
+        uint64_t             model_size,
+        uint64_t             gate_offset,
+        uint64_t             up_offset,
+        uint64_t             down_offset,
+        uint32_t             gate_type,
+        uint32_t             down_type,
+        uint64_t             gate_expert_bytes,
+        uint64_t             gate_row_bytes,
+        uint64_t             down_expert_bytes,
+        uint64_t             down_row_bytes,
+        uint32_t             expert_in_dim,
+        uint32_t             expert_mid_dim,
+        uint32_t             out_dim,
+        uint32_t             n_total_expert,
+        const int32_t       *selected,
+        const float         *expert_weight,
+        uint32_t             n_expert_used,
+        float                clamp,
+        const float         *x,
+        uint32_t             layer_index,
+        uint32_t             n_tok) {
+    const int profile = ds4_hybrid_moe_profile_enabled();
+    /* This spike only speaks the DeepSeek V4 Flash quant layout: IQ2_XXS
+     * gate/up, Q2_K down (ggml type ids 16 and 10) -- same as forward_one. */
+    if (gate_type != 16u || down_type != 10u) return 0;
+    if (!out || !model_map || !selected || !expert_weight || !x ||
+        n_tok == 0 || n_expert_used == 0 || n_total_expert == 0 ||
+        expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0) {
+        return 0;
+    }
+
+    if (!ds4_hybrid_gpu_ready()) return 0;
+
+    /* Request a cache big enough to hold every expert of this layer: with
+     * the default budget (512 slots) this always fits DeepSeek V4 Flash's
+     * 256 experts/layer, so the whole batch amortizes to one load per
+     * expert.  cuda_stream_expert_cache_prepare() clamps this down to
+     * whatever the configured budget / free VRAM actually allow. */
+    cuda_stream_expert_cache *cache =
+        cuda_stream_expert_cache_prepare(gate_expert_bytes, down_expert_bytes, n_total_expert);
+    if (!cache) return 0;
+
+    if (profile) {
+        static int atexit_registered = 0;
+        g_hybrid_moe_profile.calls++;
+        if (!atexit_registered) {
+            atexit(ds4_hybrid_moe_profile_report);
+            atexit_registered = 1;
+        }
+    }
+
+    /* Step 1: the unique set of experts this whole batch touches. */
+    const uint64_t n_pairs = (uint64_t)n_tok * n_expert_used;
+    std::vector<uint8_t> seen(n_total_expert, 0);
+    std::vector<int32_t> unique_experts;
+    unique_experts.reserve(n_total_expert);
+    for (uint64_t i = 0; i < n_pairs; i++) {
+        const int32_t e = selected[i];
+        if (e < 0 || (uint32_t)e >= n_total_expert) return 0;
+        if (!seen[(uint32_t)e]) {
+            seen[(uint32_t)e] = 1;
+            unique_experts.push_back(e);
+        }
+    }
+    const uint32_t n_unique = (uint32_t)unique_experts.size();
+    if (n_unique == 0 || cache->capacity < n_unique) {
+        /* Cache too small to hold this layer's whole working set: decline
+         * so the caller falls back to the CPU path instead of risking a
+         * slot getting evicted (and silently reused for another expert)
+         * between seeding and use further down. */
+        return 0;
+    }
+
+    /* Step 2: seed every unique expert exactly once -- this is the load
+     * that the whole batch amortizes across, the point of this function. */
+    std::vector<int32_t> slot_of_expert(n_total_expert, -1);
+    for (uint32_t i = 0; i < n_unique; i++) {
+        const uint32_t expert = (uint32_t)unique_experts[i];
+        const double load_t0 = profile ? ds4_hybrid_moe_now_sec() : 0.0;
+        int vram_hit = 0;
+        int t2_hit = -1;
+        double t2_extra_sec = 0.0;
+        const int slot = ds4_hybrid_moe_seed_one_with_t2(
+                cache, model_map, model_size, layer_index, n_total_expert,
+                expert, gate_offset, up_offset, down_offset,
+                gate_expert_bytes, down_expert_bytes, &vram_hit, &t2_hit,
+                &t2_extra_sec);
+        if (slot < 0) return 0;
+        if (profile) {
+            const double elapsed = ds4_hybrid_moe_now_sec() - load_t0;
+            g_hybrid_moe_profile.load_sec += elapsed;
+            if (vram_hit) {
+                g_hybrid_moe_profile.hits++;
+            } else {
+                g_hybrid_moe_profile.misses++;
+                if (t2_hit == 1) {
+                    g_hybrid_moe_profile.t2_hits++;
+                    g_hybrid_moe_profile.t2_hit_sec += elapsed;
+                } else if (t2_hit == 0) {
+                    g_hybrid_moe_profile.t2_misses++;
+                    g_hybrid_moe_profile.t2_miss_sec += t2_extra_sec;
+                }
+            }
+        }
+        slot_of_expert[expert] = slot;
+    }
+
+    /* Step 3: translate raw expert ids to VRAM slot ids for the whole
+     * batch (weights need no translation, they stay in router order). */
+    std::vector<int32_t> selected_slots(n_pairs);
+    for (uint64_t i = 0; i < n_pairs; i++) {
+        selected_slots[i] = slot_of_expert[(uint32_t)selected[i]];
+    }
+
+    if (!ds4_hybrid_moe_batch_io_state_ensure(expert_in_dim, out_dim, n_tok) ||
+        !ds4_hybrid_moe_state_ensure(expert_in_dim, expert_mid_dim, out_dim, (uint32_t)n_pairs)) {
+        return 0;
+    }
+    ds4_hybrid_moe_batch_io_state &io = g_hybrid_moe_batch_io_state;
+    ds4_hybrid_moe_state &s = g_hybrid_moe_state;
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    int ok = 1;
+
+    /* Step 4: one-shot upload of the whole batch's activations, selected
+     * VRAM slots and router weights. */
+    const double upload_t0 = profile ? ds4_hybrid_moe_now_sec() : 0.0;
+    ok = ok && cuda_ok(cudaMemcpy(io.d_x, x, (size_t)n_tok * expert_in_dim * sizeof(float),
+                                 cudaMemcpyHostToDevice),
+                       "hybrid moe batch x upload");
+    ok = ok && cuda_ok(cudaMemcpy(s.d_selected, selected_slots.data(), (size_t)n_pairs * sizeof(int32_t),
+                                 cudaMemcpyHostToDevice),
+                       "hybrid moe batch selected upload");
+    ok = ok && cuda_ok(cudaMemcpy(s.d_weights, expert_weight, (size_t)n_pairs * sizeof(float),
+                                 cudaMemcpyHostToDevice),
+                       "hybrid moe batch weights upload");
+    if (profile) g_hybrid_moe_profile.upload_sec += ds4_hybrid_moe_now_sec() - upload_t0;
+
+    /* Step 5: a single launch per stage over every (token, slot) pair --
+     * the kernels already carry an explicit token/pair dimension (reused
+     * from the full-GPU routed_moe path), so the whole batch runs without
+     * a per-token host loop. */
+    const double kernel_t0 = profile ? ds4_hybrid_moe_now_sec() : 0.0;
+    if (ok) {
+        dim3 xq_grid(xq_blocks, n_tok, 1);
+        q8_K_quantize_kernel<<<xq_grid, 256>>>(io.d_xq, io.d_x, expert_in_dim, n_tok);
+        ok = cuda_ok(cudaGetLastError(), "hybrid moe batch x quantize launch");
+    }
+    if (ok) {
+        dim3 qgrid((expert_mid_dim + 127u) / 128u, (uint32_t)n_pairs, 1);
+        moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256>>>(
+                s.d_gate, s.d_up, s.d_mid,
+                cache->gate_ptr, cache->up_ptr,
+                io.d_xq, s.d_selected, s.d_weights,
+                gate_expert_bytes, gate_row_bytes,
+                xq_blocks, expert_mid_dim, n_expert_used, clamp);
+        ok = cuda_ok(cudaGetLastError(), "hybrid moe batch gate/up launch");
+    }
+    if (ok) {
+        dim3 midq_grid(midq_blocks, (uint32_t)n_pairs, 1);
+        q8_K_quantize_kernel<<<midq_grid, 256>>>(s.d_midq, s.d_mid, expert_mid_dim, (uint32_t)n_pairs);
+        ok = cuda_ok(cudaGetLastError(), "hybrid moe batch mid quantize launch");
+    }
+    if (ok) {
+        dim3 dgrid((out_dim + 31u) / 32u, (uint32_t)n_pairs, 1);
+        moe_down_qwarp32_kernel<<<dgrid, 256>>>(
+                s.d_down, cache->down_ptr, s.d_midq, s.d_selected,
+                down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert_used);
+        ok = cuda_ok(cudaGetLastError(), "hybrid moe batch down launch");
+    }
+    if (ok) {
+        const uint64_t n_out = (uint64_t)n_tok * out_dim;
+        moe_sum_kernel<<<(uint32_t)((n_out + 255u) / 256u), 256>>>(
+                io.d_out, s.d_down, out_dim, n_expert_used, n_tok);
+        ok = cuda_ok(cudaGetLastError(), "hybrid moe batch sum launch");
+    }
+    if (profile) {
+        if (ok) cudaDeviceSynchronize();
+        g_hybrid_moe_profile.kernel_sec += ds4_hybrid_moe_now_sec() - kernel_t0;
+    }
+
+    const double download_t0 = profile ? ds4_hybrid_moe_now_sec() : 0.0;
+    if (ok) {
+        ok = cuda_ok(cudaMemcpy(out, io.d_out, (size_t)n_tok * out_dim * sizeof(float),
+                                cudaMemcpyDeviceToHost),
+                     "hybrid moe batch out download");
+    }
+    if (profile) {
+        g_hybrid_moe_profile.download_sec += ds4_hybrid_moe_now_sec() - download_t0;
+        if (ok) {
+            g_hybrid_moe_profile.batch_calls++;
+            g_hybrid_moe_profile.batch_tokens += n_tok;
+            g_hybrid_moe_profile.batch_unique_experts += n_unique;
+        }
+        if (g_hybrid_moe_profile.calls % DS4_HYBRID_MOE_PROFILE_REPORT_EVERY == 0) {
+            ds4_hybrid_moe_profile_report();
+        }
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);

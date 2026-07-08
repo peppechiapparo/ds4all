@@ -1498,6 +1498,23 @@ static cli_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--hybrid-moe")) {
+            setenv("DS4_HYBRID_MOE", "1", 1);
+        } else if (!strcmp(arg, "--hybrid-no-prefill")) {
+            setenv("DS4_HYBRID_PREFILL", "0", 1);
+        } else if (!strcmp(arg, "--hybrid-no-decode")) {
+            setenv("DS4_HYBRID_DECODE", "0", 1);
+        } else if (!strcmp(arg, "--ram-streaming-cache-experts")) {
+            uint64_t bytes = 0;
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg), &bytes)) {
+                fprintf(stderr,
+                        "ds4: --ram-streaming-cache-experts must be a positive GiB value, e.g. 8GB\n");
+                exit(2);
+            }
+            char gib_buf[32];
+            snprintf(gib_buf, sizeof(gib_buf), "%llu",
+                      (unsigned long long)(bytes / (1024ull * 1024ull * 1024ull)));
+            setenv("DS4_HYBRID_T2_GB", gib_buf, 1);
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {

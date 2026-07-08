@@ -7530,6 +7530,167 @@ static void layer_routed_moe_one(
     free(gate);
 }
 
+#ifndef DS4_NO_GPU
+/* DS4_HYBRID_MOE spike: when set (and not "0"), the routed experts of a
+ * decode step run on the GPU (see ds4_gpu_hybrid_moe_forward_one()) instead
+ * of the CPU matvec path below.  Disabled by default: with the env var
+ * unset, layer_routed_moe_one_prealloc() behaves exactly as before. */
+static bool ds4_hybrid_moe_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_HYBRID_MOE");
+        cached = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+        if (cached) {
+            fprintf(stderr, "ds4: DS4_HYBRID_MOE=1 - routed MoE experts run on GPU (spike)\n");
+        }
+    }
+    return cached != 0;
+}
+
+/* DS4_HYBRID_PREFILL: sub-flag of DS4_HYBRID_MOE that lets an A/B test turn
+ * the GPU offload off for the prefill batch alone (DS4_HYBRID_PREFILL=0)
+ * while leaving decode on the GPU.  Enabled by default whenever
+ * DS4_HYBRID_MOE is on. */
+static bool ds4_hybrid_prefill_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_HYBRID_PREFILL");
+        cached = (!env || !env[0] || strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/* DS4_HYBRID_DECODE: sub-flag of DS4_HYBRID_MOE symmetric to
+ * ds4_hybrid_prefill_enabled() above, but for the decode single-token path
+ * in layer_routed_moe_one_prealloc().  Lets an A/B test turn the GPU
+ * offload off for decode alone (DS4_HYBRID_DECODE=0) while leaving the
+ * prefill batch on the GPU.  Enabled by default whenever DS4_HYBRID_MOE is
+ * on. */
+static bool ds4_hybrid_decode_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_HYBRID_DECODE");
+        cached = (!env || !env[0] || strcmp(env, "0") != 0) ? 1 : 0;
+        if (!cached) {
+            fprintf(stderr, "ds4: DS4_HYBRID_DECODE=0 - routed MoE experts on "
+                             "decode run on CPU, prefill batch unaffected\n");
+        }
+    }
+    return cached != 0;
+}
+
+/* Prefill counterpart of layer_routed_moe_one_prealloc()'s GPU branch: offloads
+ * the routed MoE computation for a whole prefill token batch to the GPU in
+ * one shot (ds4_gpu_hybrid_moe_forward_batch()).  Each expert the batch
+ * selects is loaded into the streaming cache once and reused by every token
+ * that needs it, instead of once per token as the CPU path does.  Returns
+ * true if the GPU produced `moe` (n_tok * DS4_N_EMBD floats), false if the
+ * caller should run its own CPU path instead -- on the first failure this
+ * disables itself for the rest of the run, exactly like the decode branch. */
+static bool layer_routed_moe_prefill_hybrid(
+        float             * moe,
+        const ds4_model   * model,
+        const ds4_layer_weights * layer,
+        const float       * norm,
+        const int         * token_ids,
+        uint32_t            n_tok,
+        uint32_t            il,
+        float               clamp) {
+    static int disabled_after_failure = 0;
+    if (!ds4_hybrid_moe_enabled() || !ds4_hybrid_prefill_enabled() ||
+        disabled_after_failure) {
+        return false;
+    }
+
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    uint64_t gate_expert_bytes = 0;
+    uint64_t down_expert_bytes = 0;
+    int ok = 0;
+
+    if (expert_in_dim % QK_K == 0 && down_in_dim == DS4_N_FF_EXP &&
+        down_in_dim % QK_K == 0 &&
+        streaming_layer_gate_down_expert_bytes(layer, &gate_expert_bytes,
+                                               &down_expert_bytes)) {
+        int *selected = xmalloc((size_t)n_tok * DS4_N_EXPERT_USED * sizeof(selected[0]));
+        float *expert_weight = xmalloc((size_t)n_tok * DS4_N_EXPERT_USED * sizeof(expert_weight[0]));
+
+        for (uint32_t t = 0; t < n_tok; t++) {
+            int sel[DS4_MAX_EXPERT_USED];
+            float weights[DS4_MAX_EXPERT_USED];
+            if (layer->ffn_gate_tid2eid) {
+                layer_hash_selected_experts(sel, model, layer, token_ids[t]);
+                layer_hash_router_weights_one(weights, model, layer,
+                                              norm + (uint64_t)t * expert_in_dim, sel);
+            } else {
+                layer_topk_selected_experts(sel, weights, model, layer,
+                                            norm + (uint64_t)t * expert_in_dim);
+            }
+            /* The CPU prefill batch path (layer_routed_moe_batch() below)
+             * groups every token's down-projection contributions by
+             * ascending expert id -- it accumulates one row at a time
+             * across active_expert[0..n_active), not in the router's
+             * top-k rank order -- so floating-point addition happens in a
+             * different order than the rank order layer_topk_selected_experts()
+             * returns.  moe_sum_kernel on the GPU always adds slots
+             * 0..DS4_N_EXPERT_USED-1 in the order it is given, so to land
+             * on the same sum it must be given that same ascending-expert-id
+             * order here.  Without this sort the GPU batch reproduces the
+             * decode path's order instead (matches ds4_gpu_hybrid_moe_forward_one,
+             * which is fine there since a decode step never regroups by
+             * expert), and the result is a coherent but numerically
+             * different token stream after enough layers. */
+            for (uint32_t slot = 1; slot < DS4_N_EXPERT_USED; slot++) {
+                const int sel_v = sel[slot];
+                const float w_v = weights[slot];
+                uint32_t pos = slot;
+                while (pos > 0 && sel[pos - 1] > sel_v) {
+                    sel[pos] = sel[pos - 1];
+                    weights[pos] = weights[pos - 1];
+                    pos--;
+                }
+                sel[pos] = sel_v;
+                weights[pos] = w_v;
+            }
+            for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+                const uint32_t pair_id = t * DS4_N_EXPERT_USED + slot;
+                selected[pair_id] = sel[slot];
+                expert_weight[pair_id] = weights[slot];
+            }
+        }
+
+        ok = ds4_gpu_hybrid_moe_forward_batch(
+                moe,
+                model->map, model->size,
+                layer->ffn_gate_exps->abs_offset,
+                layer->ffn_up_exps->abs_offset,
+                layer->ffn_down_exps->abs_offset,
+                layer->ffn_gate_exps->type,
+                layer->ffn_down_exps->type,
+                gate_expert_bytes,
+                routed_expert_row_bytes(layer->ffn_gate_exps),
+                down_expert_bytes,
+                routed_expert_row_bytes(layer->ffn_down_exps),
+                (uint32_t)expert_in_dim,
+                (uint32_t)down_in_dim,
+                (uint32_t)DS4_N_EMBD,
+                DS4_N_EXPERT,
+                selected, expert_weight, DS4_N_EXPERT_USED,
+                clamp, norm, il, n_tok);
+
+        free(expert_weight);
+        free(selected);
+    }
+
+    if (!ok) {
+        disabled_after_failure = 1;
+        fprintf(stderr, "ds4: DS4_HYBRID_MOE prefill GPU path failed, falling "
+                        "back to CPU for the rest of the run\n");
+    }
+    return ok != 0;
+}
+#endif
+
 /* Decode version of routed MoE: same math as layer_routed_moe_one(), but all
  * large temporaries come from the persistent scratch arena. */
 static void layer_routed_moe_one_prealloc(
@@ -7560,6 +7721,37 @@ static void layer_routed_moe_one_prealloc(
     } else {
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
+
+#ifndef DS4_NO_GPU
+    static int hybrid_moe_disabled_after_failure = 0;
+    if (ds4_hybrid_moe_enabled() && ds4_hybrid_decode_enabled() &&
+        !hybrid_moe_disabled_after_failure) {
+        uint64_t gate_expert_bytes = 0;
+        uint64_t down_expert_bytes = 0;
+        if (streaming_layer_gate_down_expert_bytes(layer, &gate_expert_bytes, &down_expert_bytes) &&
+            ds4_gpu_hybrid_moe_forward_one(out,
+                                           model->map, model->size,
+                                           layer->ffn_gate_exps->abs_offset,
+                                           layer->ffn_up_exps->abs_offset,
+                                           layer->ffn_down_exps->abs_offset,
+                                           layer->ffn_gate_exps->type,
+                                           layer->ffn_down_exps->type,
+                                           gate_expert_bytes,
+                                           routed_expert_row_bytes(layer->ffn_gate_exps),
+                                           down_expert_bytes,
+                                           routed_expert_row_bytes(layer->ffn_down_exps),
+                                           (uint32_t)expert_in_dim,
+                                           (uint32_t)down_in_dim,
+                                           (uint32_t)DS4_N_EMBD,
+                                           DS4_N_EXPERT,
+                                           selected, expert_weight, DS4_N_EXPERT_USED,
+                                           clamp, x, il)) {
+            return;
+        }
+        hybrid_moe_disabled_after_failure = 1;
+        fprintf(stderr, "ds4: DS4_HYBRID_MOE GPU path failed, falling back to CPU for the rest of the run\n");
+    }
+#endif
 
     matvec_experts_mid_prequant(mid_all, model,
                                 layer->ffn_gate_exps,
@@ -7600,6 +7792,13 @@ static void layer_routed_moe_batch(
     if (expert_out_dim != down_in_dim || down_out_dim != DS4_N_EMBD) {
         ds4_die("routed expert tensor layout is unexpected");
     }
+
+#ifndef DS4_NO_GPU
+    if (layer_routed_moe_prefill_hybrid(moe, model, layer, norm, token_ids,
+                                        n_tok, il, clamp)) {
+        return;
+    }
+#endif
 
     const uint32_t total_pairs = n_tok * DS4_N_EXPERT_USED;
     uint32_t counts[DS4_MAX_EXPERT + 1] = {0};
@@ -8162,20 +8361,28 @@ static void layer_ffn_shared_batch(
     if (profile) t_hc_norm = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
-    if (routed_token_parallel) {
-        layer_routed_moe_tokens_parallel(moe, model, layer, norm, token_ids, n_tok, il);
-    } else {
-        for (uint32_t t = 0; t < n_tok; t++) {
-            layer_routed_moe_one_prealloc(moe + (uint64_t)t * DS4_N_EMBD,
-                                          model,
-                                          layer,
-                                          norm + (uint64_t)t * DS4_N_EMBD,
-                                          il,
-                                          token_ids[t],
-                                          DS4_SWIGLU_CLAMP_EXP,
-                                          routed_mid,
-                                          routed_xq,
-                                          routed_midq);
+    bool routed_on_gpu = false;
+#ifndef DS4_NO_GPU
+    routed_on_gpu = layer_routed_moe_prefill_hybrid(moe, model, layer, norm,
+                                                    token_ids, n_tok, il,
+                                                    DS4_SWIGLU_CLAMP_EXP);
+#endif
+    if (!routed_on_gpu) {
+        if (routed_token_parallel) {
+            layer_routed_moe_tokens_parallel(moe, model, layer, norm, token_ids, n_tok, il);
+        } else {
+            for (uint32_t t = 0; t < n_tok; t++) {
+                layer_routed_moe_one_prealloc(moe + (uint64_t)t * DS4_N_EMBD,
+                                              model,
+                                              layer,
+                                              norm + (uint64_t)t * DS4_N_EMBD,
+                                              il,
+                                              token_ids[t],
+                                              DS4_SWIGLU_CLAMP_EXP,
+                                              routed_mid,
+                                              routed_xq,
+                                              routed_midq);
+            }
         }
     }
     if (profile) t_routed = now_sec() - t0;
@@ -25967,6 +26174,20 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         ds4_engine_close(e);
         *out = NULL;
         return 1;
+    }
+#endif
+
+#ifndef DS4_NO_GPU
+    /* Force the DS4_HYBRID_PREFILL / DS4_HYBRID_DECODE gates to run now,
+     * right after startup and before any token is generated. Both are
+     * static-cached and print their info line on first call: left alone,
+     * that first call happens mid-generation (prefill batch or first
+     * decode step) and can land on the same stdout line as the first
+     * generated token, corrupting the output stream. Evaluating them here
+     * only changes *when* they run, not what they return. */
+    if (ds4_hybrid_moe_enabled()) {
+        (void)ds4_hybrid_prefill_enabled();
+        (void)ds4_hybrid_decode_enabled();
     }
 #endif
 

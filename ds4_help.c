@@ -167,6 +167,12 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB. Metal/ROCm default: 80% working set minus non-routed weights; CUDA default: backend fixed cache.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. Default: auto hot seed capped at 4096; use --ssd-streaming-cold to skip.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
+    if (tool == DS4_HELP_DS4) {
+        opt(fp, c, "--hybrid-moe", "CUDA: run routed MoE experts on the GPU (spike). Equivalent to DS4_HYBRID_MOE=1.");
+        opt(fp, c, "--hybrid-no-prefill", "With --hybrid-moe: keep the prefill batch on the CPU. Equivalent to DS4_HYBRID_PREFILL=0.");
+        opt(fp, c, "--hybrid-no-decode", "With --hybrid-moe: keep decode steps on the CPU. Equivalent to DS4_HYBRID_DECODE=0.");
+        opt(fp, c, "--ram-streaming-cache-experts NGB", "With --hybrid-moe: pinned host RAM budget for the T2 expert cache, e.g. 8GB. Equivalent to DS4_HYBRID_T2_GB.");
+    }
     opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     if (full) {
         if (tool != DS4_HELP_BENCH) {
